@@ -1,5 +1,5 @@
 # Rust as the base image
-FROM rust:1.76-slim-buster
+FROM rust:1.76-slim-buster as build
     
 # 1. Create a new empty shell project
 RUN USER=root cargo new --bin rinha
@@ -16,8 +16,14 @@ RUN rm src/*.rs
 # 4. Now that the dependency is built, copy your source code
 COPY ./src ./src
 
-# 5. Build for release.
+# build for release
 RUN rm ./target/release/deps/rinha*
-RUN cargo install --path .
+RUN cargo build --release
 
-CMD ["rinha"]
+# our final base
+FROM debian:buster-slim
+
+# copy the build artifact from the build stage
+COPY --from=build /rinha/target/release/rinha .
+
+CMD ["./rinha"]

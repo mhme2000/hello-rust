@@ -13,13 +13,19 @@ pub mod models;
 
 #[tokio::main]
 async fn main(){
-    let millis = time::Duration::from_millis(5000);
+    let port: usize = std::env::var("PORT")
+    .unwrap_or("9999".to_owned())
+    .parse()
+    .unwrap_or(9999);
+    eprintln!("Starting http server: 0.0.0.0:{port}...");    
+    let millis = time::Duration::from_millis(10000);
     thread::sleep(millis);
     let client = connect_database().await;  
     eprintln!("post connection");
+    eprintln!("{}", port);
     let arch_client = Arc::<Client>::new(client.unwrap());
     let app = configure_routes(arch_client).await;
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -31,7 +37,8 @@ async fn root() -> &'static str {
 async fn process_extract(
     State(client): State<Arc<Client>>,
     Path(id) : Path<String>,
-) -> (StatusCode, Json<Extract>){
+) -> (StatusCode, Json<Option<Extract>>){
+    let mut id_query: i32 = 0;
     let stmt_select = format!("SELECT * FROM clients WHERE  id = {}", id);
     let mut list_transactions = Vec::<TransactionExtract>::new();
     let mut client_model = Amount {
@@ -40,17 +47,12 @@ async fn process_extract(
         limite: 0
     };
     for row in client.query(&stmt_select, &[]).await.unwrap() {
-        let id_query: i32 = row.get("id");
-        if id_query <= 0 {
-            let result = Extract{
-                saldo: client_model,
-                ultimas_transacoes: list_transactions
-            };
-            return (StatusCode::NOT_FOUND, Json(result));
-
-        }
+        id_query = row.get("id");
         client_model.total =  row.get("saldo");
         client_model.limite = row.get("limite");
+    }
+    if id_query <= 0 {
+        return (StatusCode::NOT_FOUND, Json(None));
     }
     let stmt_select_transactions = format!("select * from transactions where client_id = {} order by realizad_em desc limit 10", id);
     for row in client.query(&stmt_select_transactions, &[]).await.unwrap() {
@@ -66,7 +68,7 @@ async fn process_extract(
         saldo: client_model,
         ultimas_transacoes: list_transactions
     };
-    return (StatusCode::OK, Json(result));
+    return (StatusCode::OK, Json(Some(result)));
 
 }
 
@@ -75,19 +77,16 @@ async fn process_transaction(
     Path(id) : Path<String>,
     Json(mut payload): Json<Transaction>,
 ) -> (StatusCode, Json<Option<TransactionResult>>){
-    if id.parse::<i32>().unwrap() <= 0 {
-        return (StatusCode::UNPROCESSABLE_ENTITY, Json(None));
-    }
     if payload.valor <= 0 {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(None));
     }
-    if payload.tipo != 'c' || payload.tipo != 'd'{
+    if payload.tipo != 'c' && payload.tipo != 'd'{
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(None));
     }
     if payload.descricao.len() < 1 || payload.descricao.len() > 10 {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(None));
     }
-    let stmt_select = format!("SELECT * FROM clients WHERE  id = {}", id);
+    let stmt_select = format!("SELECT * FROM clients WHERE  id = {} FOR UPDATE;", id);
     let mut transaction_model = TransactionResult {
         limite: 0,
         saldo: 0
@@ -102,22 +101,21 @@ async fn process_transaction(
         client_model.saldo =  row.get("saldo");
         client_model.limite = row.get("limite");
         transaction_model.limite = client_model.limite;
-        if client_model.id_cliente <= 0 {
-            return (StatusCode::NOT_FOUND, Json(Some(transaction_model)));
-        }
-        if client_model.saldo + payload.valor < -1 * client_model.limite {
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(Some(transaction_model)));
-        }
     }
-    let stmt_insert = format!("INSERT INTO transactions values(nextval('transactions_id_seq'), {}, {}, '{}', '{}', now())", &id, &payload.valor, &payload.tipo, &payload.descricao); 
-    client.execute(&stmt_insert, &[]).await.unwrap();
-
+    if client_model.id_cliente <= 0 {
+        return (StatusCode::NOT_FOUND, Json(Some(transaction_model)));
+    }
+    if payload.tipo == 'd' && (client_model.saldo - payload.valor).abs() > client_model.limite {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(Some(transaction_model)));
+    }
+    let mut stmt_insert = format!("INSERT INTO transactions values(nextval('transactions_id_seq'), {}, {}, '{}', '{}', now());", &id, &payload.valor, &payload.tipo, &payload.descricao); 
     if payload.tipo == 'd'{
         payload.valor = payload.valor * -1;
     }
     transaction_model.saldo = client_model.saldo + payload.valor;
-    let stmt_second_insert = format!("UPDATE clients SET saldo = {} WHERE id = {}", client_model.saldo + payload.valor, id);
-    client.execute(&stmt_second_insert, &[]).await.unwrap();
+    let stmt_second_insert = format!("UPDATE clients SET saldo = {} WHERE id = {};", client_model.saldo + payload.valor, id);
+    stmt_insert.push_str(&stmt_second_insert);
+    client.batch_execute(&stmt_insert).await.unwrap();
     return (StatusCode::OK, Json(Some(transaction_model)));
 
 }
